@@ -3,12 +3,13 @@
 Section A — Single-RHS (n_units=1):
   Models the feature-selection ON path in __sub_fit: each output unit is solved
   independently with a (n_feat+1,) RHS vector under threadpool_limits(limits=1).
+  Measures per-unit solve time.
 
-Section B — Multi-RHS (n_units > 1):
-  Models the no-feature-selection primal path in __sub_fit: all output units share
-  the same W0 matrix and the RHS is X.T @ Y of shape (n_feat+1, n_units), solved
-  in a single call.  Shows whether scipy's Cholesky advantage grows or shrinks
-  as batch size increases.
+Section B — Projected decoder run-time:
+  Takes the per-unit times from Section A and projects to realistic decoder sizes
+  (n_units = 1000, 10000, 100000) without actually running the loop.
+  The feature-selection path is a pure sequential loop; the ratio does not change
+  with n_units, so this projection is exact.
 
 W0 is built as newX.T @ newX + alpha*I (same as __sub_fit), so the conditioning
 is realistic (SPD, well-conditioned with alpha=100).
@@ -35,35 +36,33 @@ NFEAT_SWEEP = [50, 100, 200, 500, 1000, 2000]
 N_UNITS_SWEEP = [1, 10, 100, 1000]
 N_REPEATS = 10
 WARMUP = 2
+# Projected decoder sizes for Section B (no actual loop; just t_per_unit × n_units).
+N_UNITS_PROJECTED = [1_000, 10_000, 100_000]
 
 
 def make_normal_equation(
     n_feat: int,
-    n_units: int = 1,
     dtype=np.float32,
     n_samples: int = N_SAMPLES,
     alpha: float = ALPHA,
     seed: int = 0,
 ):
-    """Build (W0, rhs) the way __sub_fit (primal path) does.
+    """Build (W0, rhs) the way __sub_fit feature-selection path does for one unit.
 
     W0  : (n_feat+1, n_feat+1) SPD
-    rhs : (n_feat+1,) when n_units==1  (feature-selection path)
-          (n_feat+1, n_units) otherwise (no-feature-selection primal path)
+    rhs : (n_feat+1,) — single output unit
     """
     rng = np.random.default_rng(seed)
     X = rng.standard_normal((n_samples, n_feat)).astype(dtype)
     Xa = np.hstack([X, np.ones((n_samples, 1), dtype=dtype)])  # add bias column
     W0 = Xa.T @ Xa + alpha * np.eye(n_feat + 1, dtype=dtype)
-    Y = rng.standard_normal((n_samples, n_units)).astype(dtype)
-    rhs = Xa.T @ Y  # (n_feat+1, n_units)
-    if n_units == 1:
-        rhs = rhs[:, 0]  # (n_feat+1,) — matches feature-selection path exactly
+    y = rng.standard_normal(n_samples).astype(dtype)
+    rhs = Xa.T @ y  # (n_feat+1,)
     return W0, rhs
 
 
-def bench_solve(solver_fn, W0, rhs, n_repeats: int = N_REPEATS, warmup: int = WARMUP):
-    """Return median wall-time in seconds.
+def bench_solve_once(solver_fn, W0, rhs, n_repeats: int = N_REPEATS, warmup: int = WARMUP):
+    """Return median wall-time in seconds for a single solve call.
 
     Copies W0 and rhs on every call: LAPACK dpotrf/dgesv overwrite 'a' in-place,
     so without copying the factorisation from the first call corrupts later ones.
@@ -76,6 +75,8 @@ def bench_solve(solver_fn, W0, rhs, n_repeats: int = N_REPEATS, warmup: int = WA
         solver_fn(W0.copy(), rhs.copy())
         times.append(time.perf_counter() - t0)
     return float(np.median(times))
+
+
 
 
 def print_env():
@@ -93,82 +94,75 @@ def print_env():
         print("BLAS: (none detected by threadpoolctl, e.g. Accelerate)")
 
 
-def section_a(limit_threads: bool):
+def section_a(limit_threads: bool) -> dict:
+    """Run Section A and return {(dtype_name, n_feat): (t_scipy, t_numpy)}."""
     print("\n" + "=" * 60)
     print("Section A: Single-RHS (n_units=1), n_feat sweep")
-    print("Models feature-selection ON path (per-unit solve)")
-    print("ratio = scipy / numpy  (>1 means scipy is slower)")
+    print("Per-unit solve time; ratio = scipy / numpy (>1 = scipy slower)")
     print("=" * 60)
 
+    results = {}
     ctx = threadpool_limits(limits=1, user_api="blas") if limit_threads else _nullctx()
     with ctx:
         for dtype in DTYPES:
-            print(f"\ndtype={np.dtype(dtype).name}")
+            dname = np.dtype(dtype).name
+            print(f"\ndtype={dname}")
             hdr = f"  {'n_feat':>7} {'matrix':>9} {'scipy_us':>10} {'numpy_us':>10} {'ratio':>7}"
             print(hdr)
             print("  " + "-" * (len(hdr) - 2))
             for n_feat in NFEAT_SWEEP:
-                W0, rhs = make_normal_equation(n_feat, n_units=1, dtype=dtype)
+                W0, rhs = make_normal_equation(n_feat, dtype=dtype)
                 dim = W0.shape[0]
-                ts = bench_solve(_solve_scipy, W0, rhs)
-                tn = bench_solve(_solve_numpy, W0, rhs)
+                ts = bench_solve_once(_solve_scipy, W0, rhs)
+                tn = bench_solve_once(_solve_numpy, W0, rhs)
+                results[(dname, n_feat)] = (ts, tn)
                 print(
                     f"  {n_feat:>7} {dim:>4}x{dim:<4} "
                     f"{ts * 1e6:>9.1f} {tn * 1e6:>9.1f} {ts / tn:>7.2f}"
                 )
+    return results
 
 
-def section_b(limit_threads: bool):
+def section_b(per_unit: dict):
+    """Section B: project per-unit times from Section A to full decoder sizes."""
     print("\n" + "=" * 60)
-    print("Section B: Multi-RHS (batched), n_feat x n_units grid")
-    print("Models no-feature-selection primal path (single batched solve)")
-    print("ratio = scipy / numpy  (>1 means scipy is slower)")
+    print("Section B: Projected total decoder time (t_per_unit × n_units)")
+    print("Feature-selection path is a pure sequential loop; ratio is constant.")
+    print("ratio = scipy / numpy (>1 = scipy slower)")
     print("=" * 60)
 
-    ctx = threadpool_limits(limits=1, user_api="blas") if limit_threads else _nullctx()
-    with ctx:
-        # B1: ratio grid
-        for dtype in DTYPES:
-            print(f"\ndtype={np.dtype(dtype).name}  — ratio grid")
-            col_hdr = f"  {'n_feat':>7} |" + "".join(f" {u:>8}" for u in N_UNITS_SWEEP)
-            units_hdr = "  n_units→  |" + "".join(f" {u:>8}" for u in N_UNITS_SWEEP)
-            print(units_hdr)
-            print("  " + "-" * (len(col_hdr) - 2))
-            for n_feat in NFEAT_SWEEP:
-                row = f"  {n_feat:>7} |"
-                for n_units in N_UNITS_SWEEP:
-                    W0, rhs = make_normal_equation(n_feat, n_units=n_units, dtype=dtype)
-                    ts = bench_solve(_solve_scipy, W0, rhs)
-                    tn = bench_solve(_solve_numpy, W0, rhs)
-                    row += f" {ts / tn:>8.2f}"
-                print(row)
+    for dtype in DTYPES:
+        dname = np.dtype(dtype).name
+        print(f"\ndtype={dname}")
 
-        # B2: per-unit time breakdown
-        print("\n" + "-" * 60)
-        print("Section B2: per-unit time (total_ms / n_units)")
-        print("Shows whether scipy amortises better with larger batch")
-        print("-" * 60)
-        for dtype in DTYPES:
-            print(f"\ndtype={np.dtype(dtype).name}")
-            hdr = (
-                f"  {'n_feat':>7} {'n_units':>8} "
-                f"{'scipy_tot_us':>13} {'numpy_tot_us':>13} "
-                f"{'scipy/unit_us':>14} {'numpy/unit_us':>14} "
-                f"{'ratio':>7}"
-            )
-            print(hdr)
-            print("  " + "-" * (len(hdr) - 2))
-            for n_feat in NFEAT_SWEEP:
-                for n_units in N_UNITS_SWEEP:
-                    W0, rhs = make_normal_equation(n_feat, n_units=n_units, dtype=dtype)
-                    ts = bench_solve(_solve_scipy, W0, rhs)
-                    tn = bench_solve(_solve_numpy, W0, rhs)
-                    print(
-                        f"  {n_feat:>7} {n_units:>8} "
-                        f"{ts * 1e6:>13.1f} {tn * 1e6:>13.1f} "
-                        f"{ts * 1e6 / n_units:>14.2f} {tn * 1e6 / n_units:>14.2f} "
-                        f"{ts / tn:>7.2f}"
-                    )
+        # ratio grid
+        units_hdr = "  n_units→  |" + "".join(f" {u:>10}" for u in N_UNITS_PROJECTED)
+        print(f"\n  ratio grid (scipy/numpy)")
+        print(units_hdr)
+        print("  " + "-" * (len(units_hdr) - 2))
+        for n_feat in NFEAT_SWEEP:
+            ts, tn = per_unit[(dname, n_feat)]
+            row = f"  {n_feat:>7} |"
+            for n_units in N_UNITS_PROJECTED:
+                row += f" {ts / tn:>10.2f}"
+            print(row)
+
+        # absolute time table
+        print(f"\n  absolute projected time (seconds)")
+        hdr2 = (
+            f"  {'n_feat':>7} {'n_units':>10} "
+            f"{'scipy_s':>10} {'numpy_s':>10} {'diff_s':>10} {'ratio':>7}"
+        )
+        print(hdr2)
+        print("  " + "-" * (len(hdr2) - 2))
+        for n_feat in NFEAT_SWEEP:
+            ts, tn = per_unit[(dname, n_feat)]
+            for n_units in N_UNITS_PROJECTED:
+                print(
+                    f"  {n_feat:>7} {n_units:>10} "
+                    f"{ts * n_units:>10.1f} {tn * n_units:>10.1f} "
+                    f"{(ts - tn) * n_units:>+10.1f} {ts / tn:>7.2f}"
+                )
 
 
 class _nullctx:
@@ -195,8 +189,8 @@ def main():
     else:
         print("\nRunning with default BLAS thread count (--no-thread-limit)")
 
-    section_a(limit_threads=limit)
-    section_b(limit_threads=limit)
+    per_unit = section_a(limit_threads=limit)
+    section_b(per_unit)
 
 
 if __name__ == "__main__":
